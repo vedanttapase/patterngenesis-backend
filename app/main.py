@@ -241,6 +241,4 @@ def ai_edit_endpoint(req: EditRequest):
     }
 
 
-# Serve the frontend as static files (single-page app)
-_FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "frontend")
-app.mount("/", StaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend")
+
