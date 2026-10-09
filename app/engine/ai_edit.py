@@ -1,96 +1,112 @@
 """
-PatternGenesis - AI-Assisted Edit Layer
-Per the project's own architecture requirement: the "AI" layer TRANSLATES a
-natural-language instruction into structured geometric operations; it never
-generates a new picture directly. This is a deterministic rule/keyword
-parser (regex + numeric extraction) rather than an LLM call, so every edit
-is reproducible and auditable. It operates on the same parameter dict used
-by /generate endpoints (rows, cols, symmetry, nfold, rings, motif_sides...).
+PatternGenesis - deterministic natural-language parameter editing.
 
-If ANTHROPIC_API_KEY is configured, `interpret_with_llm` can optionally be
-used to handle more open-ended phrasing by asking an LLM to emit ONLY a
-JSON object of {op, ...args} which is then executed by the same
-`apply_operation` executor below (so the geometry engine -- not the LLM --
-still performs the actual math). This keeps the "LLM never IS the geometry
-engine" requirement intact even when the LLM is available.
+Instructions are mapped to explicit operations. Unsupported requests stay
+unchanged instead of pretending that an unsupported feature was applied.
 """
 from __future__ import annotations
-import re
-from typing import Dict, Tuple, List
 
-NUM_RE = re.compile(r"-?\d+(\.\d+)?")
+import re
+from typing import Dict, Any
+
+NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+SET_TO_RE = re.compile(r"\b(?:set|make|change|switch)\b.*?\bto\s+(-?\d+(?:\.\d+)?)")
 
 
 def _first_number(text: str, default=None):
-    m = NUM_RE.search(text)
-    return float(m.group()) if m else default
+    match = NUM_RE.search(text)
+    return float(match.group()) if match else default
+
+
+def _target_number(text: str):
+    match = SET_TO_RE.search(text)
+    return float(match.group(1)) if match else None
 
 
 def parse_instruction(instruction: str, current_params: Dict) -> Dict:
-    """
-    Returns {"op": str, "changes": {...}, "explanation": str}.
-    Supported ops (deliberately explicit, matches spec examples):
-      - increase_repetitions / decrease_repetitions   (nfold / rows / cols)
-      - set_symmetry                                  ("make symmetric", "8-fold")
-      - increase_rings / decrease_rings
-      - change_motif                                  (polygon/star + sides)
-      - regenerate_seed                                ("try another version")
-      - complete_missing                              (routes to /restore)
-      - unknown                                        (no confident match)
-    """
-    text = instruction.lower().strip()
-    changes: Dict = {}
+    """Translate a supported instruction into an auditable parameter change."""
+    text = str(instruction or "").lower().strip()
+    changes: Dict[str, Any] = {}
     op = "unknown"
     explanation = "No confident mapping found; parameters unchanged."
 
-    if any(k in text for k in ["missing", "damaged", "complete the", "reconstruct", "fill in"]):
-        op = "complete_missing"
-        explanation = "Routed to symmetry-based restoration on the surviving geometry."
-        return {"op": op, "changes": {}, "explanation": explanation}
-
-    if "symmetric" in text or "symmetry" in text or "fold" in text:
-        n = _first_number(text)
-        if n:
-            n = int(n)
-            changes["nfold"] = n
-            changes["symmetry"] = "4fold" if n % 4 == 0 else ("2fold" if n % 2 == 0 else "none")
-            op = "set_symmetry"
-            explanation = f"Set symmetry order to {n} and re-derived the fundamental domain."
-        elif "make" in text and "symmetric" in text:
-            op = "set_symmetry"
-            changes["symmetry"] = "4fold"
-            changes["nfold"] = current_params.get("nfold", 8)
-            explanation = "Enforced 4-fold symmetry (default) since no explicit order was given."
+    if not text:
         return {"op": op, "changes": changes, "explanation": explanation}
 
-    if "repetition" in text or "repeat" in text or "columns" in text or "rows" in text:
+    if any(k in text for k in ("missing", "damaged", "complete the", "reconstruct", "fill in")):
+        return {
+            "op": "complete_missing",
+            "changes": {},
+            "explanation": "Restoration requires an image and optional mask via /api/restore.",
+        }
+
+    if any(k in text for k in ("symmetric", "symmetry", "fold")):
         n = _first_number(text)
-        increase = any(k in text for k in ["increase", "more", "add"])
-        decrease = any(k in text for k in ["decrease", "fewer", "less", "reduce"])
-        base_rows = current_params.get("rows", 7)
-        base_cols = current_params.get("cols", 7)
-        base_nfold = current_params.get("nfold", 8)
-        delta = int(n) if n else 2
-        if decrease:
-            delta = -abs(delta)
-        elif increase or n:
-            delta = abs(delta)
-        if "nfold" in current_params or "rings" in current_params:
-            changes["nfold"] = max(2, base_nfold + delta)
-        else:
-            changes["rows"] = max(2, base_rows + delta)
-            changes["cols"] = max(2, base_cols + delta)
-        op = "increase_repetitions" if delta > 0 else "decrease_repetitions"
-        explanation = f"Adjusted repetition count by {delta:+d}."
+        if n is not None:
+            order = int(n)
+            if order < 2:
+                return {"op": op, "changes": {}, "explanation": "Symmetry order must be at least 2; parameters unchanged."}
+            if "nfold" in current_params or "rings" in current_params or "motif" in current_params:
+                changes["nfold"] = min(order, 24)
+                op = "set_symmetry"
+                explanation = f"Set rotational repetition to {changes['nfold']}-fold."
+            elif "symmetry" in current_params:
+                if order in (2, 4):
+                    changes["symmetry"] = f"{order}fold"
+                    op = "set_symmetry"
+                    explanation = f"Set grid symmetry to {order}-fold."
+                else:
+                    return {
+                        "op": "unknown",
+                        "changes": {},
+                        "explanation": "The grid generator supports only 2-fold, 4-fold, or no symmetry; parameters unchanged.",
+                    }
+        elif "make" in text and "symmetric" in text:
+            if "symmetry" in current_params:
+                changes["symmetry"] = "4fold"
+            else:
+                changes["nfold"] = min(24, max(2, int(current_params.get("nfold", 8))))
+            op = "set_symmetry"
+            explanation = "Applied the generator's supported symmetric mode."
         return {"op": op, "changes": changes, "explanation": explanation}
 
     if "ring" in text:
+        target = _target_number(text)
         n = _first_number(text)
-        base = current_params.get("rings", 3)
-        delta = int(n) if n else (1 if "more" in text or "increase" in text else -1)
-        changes["rings"] = max(1, base + delta)
+        base = int(current_params.get("rings", 3))
+        if target is not None:
+            value = int(target)
+        else:
+            delta = int(n) if n is not None else 1
+            if any(k in text for k in ("decrease", "fewer", "less", "reduce", "remove")):
+                delta = -abs(delta)
+            elif any(k in text for k in ("increase", "more", "add")):
+                delta = abs(delta)
+            value = base + delta
+        changes["rings"] = max(1, min(8, value))
         op = "change_rings"
-        explanation = f"Changed ring count to {changes['rings']}."
+        explanation = f"Changed ring count from {base} to {changes['rings']}."
+        return {"op": op, "changes": changes, "explanation": explanation}
+
+    if any(k in text for k in ("repetition", "repeat", "columns", "rows")):
+        n = _first_number(text)
+        increase = any(k in text for k in ("increase", "more", "add"))
+        decrease = any(k in text for k in ("decrease", "fewer", "less", "reduce", "remove"))
+        base_rows = int(current_params.get("rows", 7))
+        base_cols = int(current_params.get("cols", 7))
+        base_nfold = int(current_params.get("nfold", 8))
+        delta = int(n) if n is not None else 2
+        if decrease:
+            delta = -abs(delta)
+        elif increase or n is not None:
+            delta = abs(delta)
+        if "nfold" in current_params or "rings" in current_params or "motif" in current_params:
+            changes["nfold"] = max(2, min(24, base_nfold + delta))
+        else:
+            changes["rows"] = max(2, min(25, base_rows + delta))
+            changes["cols"] = max(2, min(25, base_cols + delta))
+        op = "increase_repetitions" if delta > 0 else "decrease_repetitions"
+        explanation = f"Adjusted repetition count by {delta:+d}."
         return {"op": op, "changes": changes, "explanation": explanation}
 
     if "star" in text:
@@ -98,7 +114,8 @@ def parse_instruction(instruction: str, current_params: Dict) -> Dict:
         op = "change_motif"
         explanation = "Switched motif to star."
         return {"op": op, "changes": changes, "explanation": explanation}
-    if "polygon" in text or "hexagon" in text or "square" in text or "triangle" in text:
+
+    if any(k in text for k in ("polygon", "hexagon", "square", "triangle")):
         changes["motif"] = "polygon"
         if "hexagon" in text:
             changes["motif_sides"] = 6
@@ -110,20 +127,20 @@ def parse_instruction(instruction: str, current_params: Dict) -> Dict:
         explanation = "Switched motif shape/side-count."
         return {"op": op, "changes": changes, "explanation": explanation}
 
-    if "another" in text or "regenerate" in text or "different version" in text or "new version" in text:
+    if any(k in text for k in ("another", "regenerate", "different version", "new version")):
         changes["seed"] = int(current_params.get("seed", 42)) + 1
         op = "regenerate_seed"
-        explanation = "Regenerated with a new seed inside the same symmetry constraints."
+        explanation = "Regenerated with the next deterministic seed."
         return {"op": op, "changes": changes, "explanation": explanation}
 
-    if "height" in text or "extrude" in text or "taller" in text or "shorter" in text:
-        n = _first_number(text)
-        base = current_params.get("extrude_height", 20)
-        delta = n if n else (5 if "taller" in text else -5)
-        changes["extrude_height"] = max(2, base + delta)
-        op = "change_height"
-        explanation = f"Set 3D extrusion height to {changes['extrude_height']}."
-        return {"op": op, "changes": changes, "explanation": explanation}
+    if any(k in text for k in ("height", "extrude", "taller", "shorter")):
+        # This backend does not yet generate 3D geometry. Do not report a
+        # height change as if it affected the rendered 2D output.
+        return {
+            "op": "unknown",
+            "changes": {},
+            "explanation": "3D extrusion is not implemented by this backend; parameters unchanged.",
+        }
 
     return {"op": op, "changes": changes, "explanation": explanation}
 
