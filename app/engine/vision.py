@@ -108,11 +108,9 @@ def build_geometry_graph_from_contours(contours: List[np.ndarray],
     """
     g = GeometryGraph()
     all_points: List[Tuple[float, float]] = []
-    point_owner: List[Tuple[int, int]] = []  # (contour_idx, point_idx)
     for ci, c in enumerate(contours):
         for pi, p in enumerate(c):
             all_points.append((float(p[0]), float(p[1])))
-            point_owner.append((ci, pi))
 
     if not all_points:
         return g
