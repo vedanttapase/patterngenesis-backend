@@ -27,6 +27,11 @@ class ParseInstructionTests(unittest.TestCase):
         self.assertEqual(result["op"], "unknown")
         self.assertEqual(result["changes"], {})
 
+    def test_regenerate_changes_radial_pattern_parameters(self):
+        result = parse_instruction("try another version", {"nfold": 8, "rings": 3, "motif": "polygon", "motif_sides": 6})
+        self.assertEqual(result["op"], "regenerate_seed")
+        self.assertEqual(result["changes"], {"motif_sides": 7})
+
     def test_blank_instruction_is_safe(self):
         result = parse_instruction("   ", {"rows": 7, "cols": 7})
         self.assertEqual(result["op"], "unknown")
