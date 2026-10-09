@@ -108,11 +108,9 @@ def build_geometry_graph_from_contours(contours: List[np.ndarray],
     """
     g = GeometryGraph()
     all_points: List[Tuple[float, float]] = []
-    point_owner: List[Tuple[int, int]] = []  # (contour_idx, point_idx)
     for ci, c in enumerate(contours):
         for pi, p in enumerate(c):
             all_points.append((float(p[0]), float(p[1])))
-            point_owner.append((ci, pi))
 
     if not all_points:
         return g
@@ -137,13 +135,18 @@ def build_geometry_graph_from_contours(contours: List[np.ndarray],
         centroid = pts[member_idx].mean(axis=0)
         g.add_node(nid, centroid[0], centroid[1])
 
-    for ci, c in enumerate(contours):
-        idx_in_all = [i for i, (cc, _) in enumerate(point_owner) if cc == ci]
-        node_seq = [int(node_id_of[i]) for i in idx_in_all]
+    offset = 0
+    for c in contours:
+        count = len(c)
+        node_seq = [int(nid) for nid in node_id_of[offset:offset + count]]
+        offset += count
         for k in range(len(node_seq) - 1):
             a, b = node_seq[k], node_seq[k + 1]
             if a != b:
                 g.add_edge(a, b, kind="contour")
+        # OpenCV contours are closed curves; preserve the closing edge.
+        if len(node_seq) > 2 and node_seq[-1] != node_seq[0]:
+            g.add_edge(node_seq[-1], node_seq[0], kind="contour")
     return g
 
 

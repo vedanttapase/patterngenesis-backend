@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import numpy as np
 import networkx as nx
+from scipy.spatial import cKDTree
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
 
@@ -81,10 +82,13 @@ def _chamfer_similarity(a: np.ndarray, b: np.ndarray, tol_scale: float) -> float
     """
     if len(a) == 0 or len(b) == 0:
         return 0.0
-    # vectorized pairwise distance
-    d_ab = np.min(np.linalg.norm(a[:, None, :] - b[None, :, :], axis=2), axis=1)
-    d_ba = np.min(np.linalg.norm(b[:, None, :] - a[None, :, :], axis=2), axis=1)
-    mean_err = (d_ab.mean() + d_ba.mean()) / 2.0
+    # KD-trees avoid allocating an O(n*m) pairwise-distance tensor for
+    # dense image-derived point clouds.
+    tree_a = cKDTree(a)
+    tree_b = cKDTree(b)
+    d_ab, _ = tree_b.query(a, k=1)
+    d_ba, _ = tree_a.query(b, k=1)
+    mean_err = (float(d_ab.mean()) + float(d_ba.mean())) / 2.0
     sim = math.exp(-mean_err / max(tol_scale, 1e-6))
     return float(sim)
 

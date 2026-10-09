@@ -1,28 +1,29 @@
 """
 PatternGenesis Backend
-Endpoints implementing: ANALYZE, GENERATE (kolam + general pattern),
-RESTORE, GEOMETRY DNA / COMPARE, AI-assisted parameter EDIT.
+Endpoints: image analysis, pattern generation, restoration, Geometry DNA
+comparison, and deterministic parameter editing.
 """
 from __future__ import annotations
+
 import base64
-import io
-import json
-import os
-from typing import Optional
+import binascii
+from typing import Literal, Optional
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 from .engine import vision, geometry_core, dna as dna_mod, kolam as kolam_mod
 from .engine import pattern as pattern_mod, restore as restore_mod, ai_edit
 
-app = FastAPI(title="PatternGenesis Engine", version="0.1.0")
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
+app = FastAPI(title="PatternGenesis Engine", version="0.1.1")
+
+# Keep permissive CORS for the current public frontend. For production, set
+# explicit trusted origins using an environment variable/deployment setting.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,33 +34,52 @@ app.add_middleware(
 
 def _b64_png(img: np.ndarray) -> str:
     ok, buf = cv2.imencode(".png", img)
-    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode()
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not encode image output.")
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
 
 
 def _decode_data_url(data_url: str) -> np.ndarray:
+    if not data_url or "," not in data_url:
+        raise HTTPException(status_code=400, detail="Mask must be a valid image data URL.")
     header, encoded = data_url.split(",", 1)
-    raw = base64.b64decode(encoded)
+    if not header.startswith("data:image/") or ";base64" not in header:
+        raise HTTPException(status_code=400, detail="Mask must be a base64-encoded image data URL.")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Mask contains invalid base64 data.")
+    if not raw:
+        raise HTTPException(status_code=400, detail="Mask image is empty.")
     arr = np.frombuffer(raw, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode mask image.")
     return img
+
+
+async def _read_image_upload(file: UploadFile) -> bytes:
+    data = await file.read(MAX_IMAGE_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds the 12 MiB upload limit.")
+    return data
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "engine": "PatternGenesis", "version": "0.1.0"}
+    return {"status": "ok", "engine": "PatternGenesis", "version": app.version}
 
 
-# --------------------------------------------------------------------------
 # ANALYZE: image -> geometry -> mathematics
-# --------------------------------------------------------------------------
-
 @app.post("/api/analyze/image")
 async def analyze_image(file: UploadFile = File(...)):
-    data = await file.read()
+    data = await _read_image_upload(file)
     try:
         result = vision.analyze_image(data)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     graph = geometry_core.GeometryGraph.from_json(result["graph"])
     dna = dna_mod.compute_geometry_dna(graph, extra={
@@ -67,53 +87,50 @@ async def analyze_image(file: UploadFile = File(...)):
         "num_dots": result["num_dots"],
         "num_corners": result["num_corners"],
     })
-
-    return JSONResponse({
-        "image_size": result["image_size"],
-        "contours": result["contours"],
-        "dot_grid": result["dot_grid"],
-        "corners": result["corners"],
-        "graph": result["graph"],
-        "geometry_dna": dna,
-    })
+    return {
+        "image_size": result["image_size"], "contours": result["contours"],
+        "dot_grid": result["dot_grid"], "corners": result["corners"],
+        "graph": result["graph"], "geometry_dna": dna,
+    }
 
 
-# --------------------------------------------------------------------------
 # GENERATE: kolam
-# --------------------------------------------------------------------------
-
 class KolamParams(BaseModel):
-    rows: int = 7
-    cols: int = 7
-    symmetry: str = "4fold"   # 4fold | 2fold | none
-    seed: int = 42
-    cell_size: float = 40.0
+    model_config = ConfigDict(extra="forbid")
+    rows: int = Field(default=7, ge=2, le=25)
+    cols: int = Field(default=7, ge=2, le=25)
+    symmetry: Literal["4fold", "2fold", "none"] = "4fold"
+    seed: int = Field(default=42, ge=0, le=2**32 - 1)
+    cell_size: float = Field(default=40.0, gt=0, le=500)
 
 
 @app.post("/api/generate/kolam")
 def generate_kolam(params: KolamParams):
-    data = kolam_mod.generate_kolam(params.rows, params.cols, params.symmetry,
-                                     params.seed, params.cell_size)
+    data = kolam_mod.generate_kolam(
+        params.rows, params.cols, params.symmetry, params.seed, params.cell_size
+    )
     svg = kolam_mod.kolam_to_svg(data)
     graph = geometry_core.GeometryGraph.from_json(data["graph"])
-    dna = dna_mod.compute_geometry_dna(graph, extra={"loops": kolam_mod.count_loops(data["graph"])})
-    return {"params": params.dict(), "svg": svg, "graph": data["graph"],
-            "dot_grid": data["dot_grid"], "geometry_dna": dna,
-            "width": data["width"], "height": data["height"]}
+    dna = dna_mod.compute_geometry_dna(
+        graph, extra={"loops": kolam_mod.count_loops(data["graph"])}
+    )
+    return {
+        "params": params.model_dump(), "svg": svg, "graph": data["graph"],
+        "dot_grid": data["dot_grid"], "geometry_dna": dna,
+        "width": data["width"], "height": data["height"],
+    }
 
 
-# --------------------------------------------------------------------------
-# GENERATE: general radial / linear pattern (jali, borders, façade motifs)
-# --------------------------------------------------------------------------
-
+# GENERATE: general radial pattern
 class RadialParams(BaseModel):
-    nfold: int = 8
-    rings: int = 3
-    motif: str = "polygon"     # polygon | star
-    motif_sides: int = 4
-    base_radius: float = 40.0
-    ring_gap: float = 35.0
-    size: float = 420.0
+    model_config = ConfigDict(extra="forbid")
+    nfold: int = Field(default=8, ge=2, le=24)
+    rings: int = Field(default=3, ge=1, le=8)
+    motif: Literal["polygon", "star"] = "polygon"
+    motif_sides: int = Field(default=4, ge=3, le=16)
+    base_radius: float = Field(default=40.0, gt=0, le=500)
+    ring_gap: float = Field(default=35.0, gt=0, le=500)
+    size: float = Field(default=420.0, gt=0, le=2000)
 
 
 @app.post("/api/generate/pattern")
@@ -125,15 +142,16 @@ def generate_pattern(params: RadialParams):
     svg = pattern_mod.radial_pattern_to_svg(data)
     graph = geometry_core.GeometryGraph.from_json(data["graph"])
     dna = dna_mod.compute_geometry_dna(graph)
-    return {"params": params.dict(), "svg": svg, "graph": data["graph"],
+    return {"params": params.model_dump(), "svg": svg, "graph": data["graph"],
             "geometry_dna": dna, "size": data["size"]}
 
 
 class BorderParams(BaseModel):
-    unit_count: int = 10
-    unit_width: float = 40.0
-    unit_height: float = 60.0
-    motif_sides: int = 6
+    model_config = ConfigDict(extra="forbid")
+    unit_count: int = Field(default=10, ge=1, le=100)
+    unit_width: float = Field(default=40.0, gt=0, le=500)
+    unit_height: float = Field(default=60.0, gt=0, le=500)
+    motif_sides: int = Field(default=6, ge=3, le=16)
 
 
 @app.post("/api/generate/border")
@@ -144,53 +162,51 @@ def generate_border(params: BorderParams):
     svg = pattern_mod.linear_border_to_svg(data)
     graph = geometry_core.GeometryGraph.from_json(data["graph"])
     dna = dna_mod.compute_geometry_dna(graph)
-    return {"params": params.dict(), "svg": svg, "graph": data["graph"], "geometry_dna": dna}
+    return {"params": params.model_dump(), "svg": svg, "graph": data["graph"],
+            "geometry_dna": dna}
 
 
-# --------------------------------------------------------------------------
 # RESTORE: damaged / missing geometry reconstruction
-# --------------------------------------------------------------------------
-
 @app.post("/api/restore")
 async def restore_endpoint(file: UploadFile = File(...), mask: Optional[str] = Form(None)):
-    """
-    `mask` (optional): a data-URL PNG painted by the user on the frontend
-    canvas (white = missing region). If omitted, an automatic low-structure
-    heuristic detects candidate missing regions.
-    """
-    data = await file.read()
-    img = vision.preprocess(vision.load_image_bytes(data))
+    """Mask is an optional base64 image data URL; white pixels mark missing areas."""
+    data = await _read_image_upload(file)
+    try:
+        img = vision.preprocess(vision.load_image_bytes(data))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if mask:
         mask_img = _decode_data_url(mask)
         if mask_img.ndim == 3:
-            mask_img = cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY)
-        mask_img = cv2.resize(mask_img, (img.shape[1], img.shape[0]))
+            if mask_img.shape[2] == 4:
+                mask_img = cv2.cvtColor(mask_img, cv2.COLOR_BGRA2GRAY)
+            else:
+                mask_img = cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY)
+        mask_img = cv2.resize(
+            mask_img, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST
+        )
         _, mask_bin = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
     else:
         mask_bin = restore_mod.auto_detect_missing_region(img)
 
     result = restore_mod.reconstruct(img, mask_bin)
-
     return {
-        "original_image": _b64_png(img),
-        "mask_image": _b64_png(mask_bin),
+        "original_image": _b64_png(img), "mask_image": _b64_png(mask_bin),
         "missing_only_image": _b64_png(result["missing_only_img"]),
         "reconstructed_image": _b64_png(result["reconstructed_img"]),
-        "symmetry_used": result["symmetry_used"],
-        "method": result["method"],
+        "symmetry_used": result["symmetry_used"], "method": result["method"],
         "coverage_from_symmetry": result["coverage_from_symmetry"],
-        "disclaimer": ("This is a MATHEMATICALLY INFERRED reconstruction derived from "
-                       "detected symmetry in the surviving geometry. It is NOT a claim "
-                       "of historical accuracy."),
+        "disclaimer": (
+            "This is a mathematically inferred reconstruction derived from detected "
+            "symmetry in surviving geometry. It is not a claim of historical accuracy."
+        ),
     }
 
 
-# --------------------------------------------------------------------------
 # GEOMETRY DNA compare
-# --------------------------------------------------------------------------
-
 class CompareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     dna_a: dict
     dna_b: dict
 
@@ -200,45 +216,51 @@ def compare(req: CompareRequest):
     return dna_mod.compare_dna(req.dna_a, req.dna_b)
 
 
-# --------------------------------------------------------------------------
-# AI-assisted parameter edit (rule-based instruction -> geometry op)
-# --------------------------------------------------------------------------
-
+# AI-assisted parameter edit
 class EditRequest(BaseModel):
-    instruction: str
+    model_config = ConfigDict(extra="forbid")
+    instruction: str = Field(min_length=1, max_length=500)
     current_params: dict
-    generator: str = "kolam"   # kolam | pattern
+    generator: Literal["kolam", "pattern"] = "kolam"
 
 
 @app.post("/api/edit/ai")
 def ai_edit_endpoint(req: EditRequest):
     parsed = ai_edit.parse_instruction(req.instruction, req.current_params)
     updated_params = ai_edit.apply_operation(req.current_params, parsed)
-
     regenerated = None
+
     if parsed["op"] != "complete_missing":
         if req.generator == "kolam":
-            kp = KolamParams(**{k: updated_params.get(k, getattr(KolamParams(), k))
-                                 for k in KolamParams().dict().keys()})
-            data = kolam_mod.generate_kolam(kp.rows, kp.cols, kp.symmetry, kp.seed, kp.cell_size)
-            svg = kolam_mod.kolam_to_svg(data)
-            regenerated = {"svg": svg, "params": kp.dict(), "graph": data["graph"]}
+            defaults = KolamParams()
+            allowed = defaults.model_fields.keys()
+            kp = KolamParams(**{
+                k: updated_params.get(k, getattr(defaults, k)) for k in allowed
+            })
+            data = kolam_mod.generate_kolam(
+                kp.rows, kp.cols, kp.symmetry, kp.seed, kp.cell_size
+            )
+            regenerated = {
+                "svg": kolam_mod.kolam_to_svg(data), "params": kp.model_dump(),
+                "graph": data["graph"],
+            }
         else:
-            rp = RadialParams(**{k: updated_params.get(k, getattr(RadialParams(), k))
-                                  for k in RadialParams().dict().keys()})
-            data = pattern_mod.generate_radial_pattern(rp.nfold, rp.rings, rp.motif,
-                                                        rp.motif_sides, rp.base_radius,
-                                                        rp.ring_gap, rp.size)
-            svg = pattern_mod.radial_pattern_to_svg(data)
-            regenerated = {"svg": svg, "params": rp.dict(), "graph": data["graph"]}
+            defaults = RadialParams()
+            allowed = defaults.model_fields.keys()
+            rp = RadialParams(**{
+                k: updated_params.get(k, getattr(defaults, k)) for k in allowed
+            })
+            data = pattern_mod.generate_radial_pattern(
+                rp.nfold, rp.rings, rp.motif, rp.motif_sides,
+                rp.base_radius, rp.ring_gap, rp.size,
+            )
+            regenerated = {
+                "svg": pattern_mod.radial_pattern_to_svg(data), "params": rp.model_dump(),
+                "graph": data["graph"],
+            }
 
     return {
-        "op": parsed["op"],
-        "changes": parsed["changes"],
-        "explanation": parsed["explanation"],
-        "updated_params": updated_params,
+        "op": parsed["op"], "changes": parsed["changes"],
+        "explanation": parsed["explanation"], "updated_params": updated_params,
         "regenerated": regenerated,
     }
-
-
-
