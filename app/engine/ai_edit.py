@@ -128,10 +128,11 @@ def parse_instruction(instruction: str, current_params: Dict) -> Dict:
         return {"op": op, "changes": changes, "explanation": explanation}
 
     if any(k in text for k in ("another", "regenerate", "different version", "new version")):
-        changes["seed"] = int(current_params.get("seed", 42)) + 1
-        op = "regenerate_seed"
-        explanation = "Regenerated with the next deterministic seed."
-        return {"op": op, "changes": changes, "explanation": explanation}
+        if any(k in current_params for k in ("nfold", "rings", "motif")):
+            current_sides = int(current_params.get("motif_sides", 6))
+            next_sides = 3 if current_sides >= 16 else max(3, current_sides + 1)
+            return {"op": "regenerate_seed", "changes": {"motif_sides": next_sides}, "explanation": f"Generated a new deterministic variation using a {next_sides}-sided motif."}
+        return {"op": "regenerate_seed", "changes": {"seed": int(current_params.get("seed", 42)) + 1}, "explanation": "Regenerated with the next deterministic seed."}
 
     if any(k in text for k in ("height", "extrude", "taller", "shorter")):
         # This backend does not yet generate 3D geometry. Do not report a
