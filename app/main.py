@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 
 from .engine import vision, geometry_core, dna as dna_mod, kolam as kolam_mod
-from .engine import pattern as pattern_mod, restore as restore_mod, ai_edit
+from .engine import pattern as pattern_mod, restore as restore_mod, ai_edit, grammar as grammar_mod
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
@@ -160,6 +160,7 @@ async def analyze_image(file: UploadFile = File(...)):
         "corners": result["corners"],
         "graph": result["graph"],
         "geometry_dna": dna,
+        "design_grammar": grammar_mod.infer_design_grammar(result["contours"], dna),
         "identity": identity,
         "source_safe": True,
     })
