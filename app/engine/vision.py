@@ -107,27 +107,53 @@ def build_geometry_graph_from_contours(contours: List[np.ndarray],
     (this is what turns disconnected pixel contours into real topology).
     """
     g = GeometryGraph()
-    all_points: List[Tuple[float, float]] = []
-    for ci, c in enumerate(contours):
-        for pi, p in enumerate(c):
-            all_points.append((float(p[0]), float(p[1])))
+    vertex_count = sum(len(contour) for contour in contours)
+    if vertex_count > 12000:
+        raise ValueError(
+            "This image contains too many contour points to analyze safely. "
+            "Crop to the main design or upload a simpler, higher-contrast image."
+        )
+    all_points: List[Tuple[float, float]] = [
+        (float(point[0]), float(point[1]))
+        for contour in contours
+        for point in contour
+    ]
 
     if not all_points:
         return g
 
-    pts = np.array(all_points)
+    pts = np.asarray(all_points, dtype=float)
     n = len(pts)
     node_id_of = -np.ones(n, dtype=int)
     next_id = 0
 
-    # naive spatial merge (fine at typical contour vertex counts < 3000)
-    for i in range(n):
+    # Spatial buckets avoid comparing every vertex against the entire image.
+    # The greedy merge rule is retained, but only nearby grid cells are searched.
+    cell_size = max(float(merge_radius), 1.0)
+    buckets: Dict[Tuple[int, int], List[int]] = {}
+    for index, point in enumerate(pts):
+        cell = (int(np.floor(point[0] / cell_size)), int(np.floor(point[1] / cell_size)))
+        buckets.setdefault(cell, []).append(index)
+
+    for i, point in enumerate(pts):
         if node_id_of[i] != -1:
             continue
         node_id_of[i] = next_id
-        dists = np.linalg.norm(pts - pts[i], axis=1)
-        close = np.where((dists < merge_radius) & (node_id_of == -1))[0]
-        node_id_of[close] = next_id
+        cell_x = int(np.floor(point[0] / cell_size))
+        cell_y = int(np.floor(point[1] / cell_size))
+        candidates = [
+            candidate
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for candidate in buckets.get((cell_x + dx, cell_y + dy), [])
+            if node_id_of[candidate] == -1
+        ]
+        if candidates:
+            candidate_points = pts[candidates]
+            distances = np.linalg.norm(candidate_points - point, axis=1)
+            close = [candidate for candidate, distance in zip(candidates, distances)
+                     if distance < merge_radius]
+            node_id_of[close] = next_id
         next_id += 1
 
     for nid in range(next_id):
@@ -144,7 +170,8 @@ def build_geometry_graph_from_contours(contours: List[np.ndarray],
             a, b = node_seq[k], node_seq[k + 1]
             if a != b:
                 g.add_edge(a, b, kind="contour")
-        # OpenCV contours are closed curves; preserve the closing edge.
+        # OpenCV contours are closed curves. Preserve the closing edge so
+        # graph topology and cycle counts match the extracted geometry.
         if len(node_seq) > 2 and node_seq[-1] != node_seq[0]:
             g.add_edge(node_seq[-1], node_seq[0], kind="contour")
     return g
